@@ -1,13 +1,16 @@
 # DATA-3 — Real-Time Market Data Pipeline
 
-**Status: ~20% slice.** The correctness core — replay harness, event-time bars
-with watermarks, emit-and-revise, quality flags, and the streaming-vs-batch
-parity proof — is built and passing. **There is no Kafka, no Flink, no
-TimescaleDB and no Grafana**; this is the algorithmic layer those systems would
-host, running in-process so it can be verified.
+**Status: ~45%.** The correctness core — replay harness, event-time bars with
+watermarks, emit-and-revise, quality flags, the streaming-vs-batch parity proof,
+derived analytics with a reorder buffer, and per-key watermarks — is built and
+tested (8 tests). **There is still no Kafka, no Flink, no TimescaleDB and no
+Grafana**; this is the algorithmic layer those systems would host, running
+in-process so it can be verified.
 
 ```bash
-python run_parity.py
+python run_parity.py      # bar parity, gap flags, rebuild drill
+python run_analytics.py   # VWAP/vol/jump parity, per-key watermarks, emit latency
+python -m pytest tests -q
 ```
 
 ## Why in-process, and what that costs
@@ -77,20 +80,59 @@ edge bars from a partial tick population and produces two wrong bars that look
 exactly like a parity bug. That's the real trap in a reprocessing runbook, and it
 bit this build before the alignment was made explicit.
 
-## What is NOT built (the other 80%)
+## Derived analytics, and the bug they exposed
+
+`python run_analytics.py` computes VWAP, realised volatility and σ-jump flags
+in-stream and against batch. The first version folded arrivals in **arrival
+order**, and the parity table said this:
+
+| metric | naive append | batch |
+|---|---|---|
+| VWAP | 504141.6478 | 504141.6478 |
+| realised vol | 0.017419 | 0.010954 |
+| jump flags | **812** | **2** |
+
+VWAP ties because it is a ratio of two sums and does not care about order.
+Realised vol and jump flags are functions of the *sequence* of returns, so a tick
+folded in three seconds out of place fabricates two spurious returns — one
+jumping back to it and one jumping forward again. **812 jump flags against 2 is
+not a tolerance to document; it is a wrong number**, and an earlier draft of this
+file called it "expected streaming/batch divergence" and moved on.
+
+The fix is a reorder buffer (`stream_with_reorder`): hold ticks, release them in
+event-time order once the watermark passes. Realised vol now lands within 0.03%
+of batch and jump flags match exactly. The cost is exactly the watermark bound in
+added latency — which is why that bound is a published parameter, not an
+implementation detail.
+
+## Per-key watermarks
+
+One global watermark fails in both directions: `min()` lets one quiet symbol
+freeze the whole board, `max()` lets one busy symbol finalise a quiet symbol's
+bars before its ticks arrive. Measured here, an illiquid symbol that stops
+trading would drift **166 minutes** behind; per-key watermarks with an idle
+timeout hold it to exactly the configured 120s. The tradeoff is stated too: the
+idle advance trades correctness for liveness, and any tick from that symbol more
+than 120s late is now dropped.
+
+Bar-emit latency: p50 2.5ms / p95 8.1ms, in-process on a laptop.
+
+## What is NOT built
 
 1. **The entire infrastructure**: Kafka, Flink/Spark Structured Streaming,
-   TimescaleDB/ClickHouse serving, Parquet archive, Grafana. In-process only.
+   TimescaleDB/ClickHouse serving, Parquet archive, Grafana. In-process only, so
+   there is no backpressure, no checkpointing, no consumer-lag metric.
 2. **A real feed.** No crypto WebSocket client; ticks are generated.
-3. **Latency metrics** — no ingest lag, no bar-emit p95, no histogram export. The
-   spec asks for these and they are absent rather than faked.
-4. **Multi-symbol.** One instrument, one watermark. Per-key watermarks and the
-   slow-partition problem are untouched.
-5. **Derived analytics**: rolling VWAP, realised volatility, σ-jump anomaly flags
-   — none implemented, so the in-stream vs batch spot-check of those is missing.
-6. **Alerting and the runbook**: gap alerts fire nowhere; the rebuild is a script
-   in `run_parity.py`, not an operational tool with a documented procedure.
-7. **Replay speed control** (1x/10x/100x) — replay is as-fast-as-possible only,
-   so the "sustained ticks/sec at 100x" figure the spec asks for is not
-   measurable here.
-8. Heartbeat-loss detection distinct from data gaps.
+3. **Replay speed control** (1x/10x/100x) — replay runs as fast as possible, so
+   the "sustained ticks/sec at 100x" figure the spec asks for is not measurable
+   here and is not quoted.
+4. **Alerting and the runbook**: gap detection produces flags and counts, but
+   nothing pages anyone, and the rebuild is a script rather than a documented
+   operational procedure.
+5. **Heartbeat-loss detection** distinct from data gaps — a feed that is
+   connected but silent is currently indistinguishable from a quiet market.
+6. **True multi-symbol bar storage.** `MultiSymbolProcessor` tracks per-key
+   watermarks and buffers, but bars are still built per symbol in memory with no
+   partitioned serving layer.
+7. **Ingest-lag metrics** (event time vs arrival time distribution), which is the
+   number an ops team actually watches.
