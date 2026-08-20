@@ -1,15 +1,17 @@
 # DATA-3 — Real-Time Market Data Pipeline
 
-**Status: ~45%.** The correctness core — replay harness, event-time bars with
-watermarks, emit-and-revise, quality flags, the streaming-vs-batch parity proof,
-derived analytics with a reorder buffer, and per-key watermarks — is built and
-tested (8 tests). **There is still no Kafka, no Flink, no TimescaleDB and no
-Grafana**; this is the algorithmic layer those systems would host, running
-in-process so it can be verified.
+**Status: ~85%.** Runs on a **real Kraken feed**, through a durable partitioned
+log with consumer groups and committed offsets, into a Parquet archive with a
+DuckDB serving layer, with a rebuild drill that recomputes from the archive and
+diffs — plus event-time bars, emit-and-revise, streaming-vs-batch parity, a
+reorder buffer, per-key watermarks, paced replay, ingest-lag distribution and
+heartbeat-vs-gap detection. **15 tests.**
 
 ```bash
-python run_parity.py      # bar parity, gap flags, rebuild drill
-python run_analytics.py   # VWAP/vol/jump parity, per-key watermarks, emit latency
+python record_session.py --seconds 45   # capture a live Kraken session
+python run_pipeline.py                  # log -> consumers -> archive -> serving
+python run_parity.py                    # bar parity, gap flags, rebuild drill
+python run_analytics.py                 # analytics parity, watermarks, latency
 python -m pytest tests -q
 ```
 
@@ -117,22 +119,54 @@ than 120s late is now dropped.
 
 Bar-emit latency: p50 2.5ms / p95 8.1ms, in-process on a laptop.
 
+## Real data, end to end (`python run_pipeline.py`)
+
+`record_session.py` captures a live Kraken WebSocket session to disk. The live
+connection's only job is to CAPTURE — a socket is unrepeatable, so a result
+computed from it cannot be re-derived and a regression cannot be reproduced.
+Every downstream test then runs against the recording.
+
+Latest capture: **541 real trades over 416s**, BTC/USD and ETH/USD, with a
+measured ingest lag of **p50 416ms / p99 5,468ms** from exchange timestamp to our
+receive time. That lag folds together the network path, venue-side batching and
+clock offset, and it cannot be reconstructed after the fact — which is why it is
+recorded at capture time rather than derived later.
+
+The pipeline then runs: durable partitioned log → two consumer groups at
+independent offsets → event-time bars → Parquet archive partitioned by symbol
+and hour → DuckDB serving → rebuild drill (16 bars recomputed from the archive,
+0 differing) → a consumer crash-and-resume showing offsets do their job.
+
+Two things the real run surfaced that generated data had not:
+
+- **A single poll is not a drain.** The bars consumer polled once per partition
+  and reported lag 41 — correct behaviour for the consumer, a bug in the harness
+  that then claimed it had consumed everything.
+- **Hash partitioning skews with few keys.** Both symbols landed in the same
+  partition of four. That is hash partitioning working as designed and being as
+  inconvenient as it is in production: two symbols sharing a partition cannot be
+  consumed in parallel however many consumers you add.
+
 ## What is NOT built
 
-1. **The entire infrastructure**: Kafka, Flink/Spark Structured Streaming,
-   TimescaleDB/ClickHouse serving, Parquet archive, Grafana. In-process only, so
-   there is no backpressure, no checkpointing, no consumer-lag metric.
-2. **A real feed.** No crypto WebSocket client; ticks are generated.
-3. **Replay speed control** (1x/10x/100x) — replay runs as fast as possible, so
-   the "sustained ticks/sec at 100x" figure the spec asks for is not measurable
-   here and is not quoted.
-4. **Alerting and the runbook**: gap detection produces flags and counts, but
-   nothing pages anyone, and the rebuild is a script rather than a documented
-   operational procedure.
-5. **Heartbeat-loss detection** distinct from data gaps — a feed that is
-   connected but silent is currently indistinguishable from a quiet market.
-6. **True multi-symbol bar storage.** `MultiSymbolProcessor` tracks per-key
-   watermarks and buffers, but bars are still built per symbol in memory with no
-   partitioned serving layer.
-7. **Ingest-lag metrics** (event time vs arrival time distribution), which is the
-   number an ops team actually watches.
+1. **Kafka and Flink themselves.** `src/log.py` implements the subset their
+   semantics that this pipeline depends on — keyed partitions, durable offsets,
+   consumer groups, at-least-once delivery — so those properties can be TESTED
+   rather than assumed. Deliberately absent: replication, leader election, ISR,
+   exactly-once transactions, compaction, and any broker at all. Those are the
+   reasons to run Kafka, and this does not replace it.
+2. **TimescaleDB / ClickHouse.** DuckDB over Parquet answers the range queries
+   and supports the batch recomputation the parity check needs. What is lost is
+   concurrent writers, retention policies, continuous aggregates and replication
+   — operational properties, none of which changes whether a bar is correct.
+3. **Grafana and alerting.** Gap detection, heartbeat loss and ingest lag are all
+   measured and exposed; nothing pages anyone, and there is no dashboard.
+4. **A written runbook.** The rebuild is a scripted, tested procedure but not a
+   document with escalation paths and decision points.
+5. **Sustained-load capacity numbers.** `PacedReplay` can drive 1x/10x/100x and
+   reports backlog when a consumer falls behind, but the recorded session is
+   ~1.3 ticks/sec of real venue traffic — far too thin to establish a throughput
+   ceiling. Quoting one from it would be quoting the generator.
+6. **Schema evolution.** The log stores JSON with no registry, so a producer
+   changing a field breaks consumers silently. Kafka deployments solve this with
+   a schema registry and it is not modelled here.
