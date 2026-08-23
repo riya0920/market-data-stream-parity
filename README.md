@@ -1,19 +1,25 @@
 # DATA-3 — Real-Time Market Data Pipeline
 
-**Status: ~85%.** Runs on a **real Kraken feed**, through a durable partitioned
+**Status: ~93%.** Runs on a **real Kraken feed**, through a durable partitioned
 log with consumer groups and committed offsets, into a Parquet archive with a
 DuckDB serving layer, with a rebuild drill that recomputes from the archive and
 diffs — plus event-time bars, emit-and-revise, streaming-vs-batch parity, a
-reorder buffer, per-key watermarks, paced replay, ingest-lag distribution and
-heartbeat-vs-gap detection. **15 tests.**
+reorder buffer, per-key watermarks, paced replay, ingest-lag distribution,
+heartbeat-vs-gap detection, a **schema registry with real compatibility
+checking**, and an **operational runbook**. **34 tests.**
 
 ```bash
 python record_session.py --seconds 45   # capture a live Kraken session
 python run_pipeline.py                  # log -> consumers -> archive -> serving
 python run_parity.py                    # bar parity, gap flags, rebuild drill
 python run_analytics.py                 # analytics parity, watermarks, latency
-python -m pytest tests -q
+python run_schema.py                    # compatibility algebra, and its limit
+python -m pytest tests -q               # 34 tests
 ```
+
+See [docs/RUNBOOK.md](docs/RUNBOOK.md) for the on-call procedures — gap, ingest
+lag, consumer lag, a bar that looks wrong, a rebuild, a schema change — written
+for whoever is holding the pager rather than whoever wrote the code.
 
 ## Why in-process, and what that costs
 
@@ -147,26 +153,88 @@ Two things the real run surfaced that generated data had not:
   inconvenient as it is in production: two symbols sharing a partition cannot be
   consumed in parallel however many consumers you add.
 
+## Schema evolution, and where a registry stops helping
+
+`src/log.py` stored JSON with no schema, so a producer that renamed a field broke
+every consumer **silently**. Run it and watch:
+
+```
+1. WITHOUT A REGISTRY -- the producer renames `price` to `px`
+consumer VWAP over correct records : 104.5000
+consumer VWAP after the rename     : nan
+exceptions raised                  : 0
+```
+
+Nothing failed. The JSON still parses, `price` is simply absent, and the
+consumer computes a number from a field that is not there. **The pipeline does
+not break — it keeps running and publishes a wrong figure.**
+
+`src/schema_registry.py` refuses the change at **registration time**, before a
+single bad record is written, which is the only place it is cheap. Once a record
+is in the log, every consumer has to cope with it forever, replays included.
+
+The compatibility algebra, run over four real changes:
+
+| change | BACKWARD | FORWARD | FULL |
+|---|---|---|---|
+| add an OPTIONAL field | ok | ok | ok |
+| add a REQUIRED field | **REFUSED** | ok | **REFUSED** |
+| rename a field | **REFUSED** | **REFUSED** | **REFUSED** |
+| narrow float → int | **REFUSED** | ok | **REFUSED** |
+
+**Row two is the asymmetry that catches people.** Adding a required field is
+forward compatible and *not* backward compatible — an old reader ignores it, a
+new reader cannot find it in the archive. So "add a field" is safe or unsafe
+depending entirely on which direction you need, and a registry set to the wrong
+mode is worse than no registry, because it issues an approval.
+
+**Row four came out against what I expected to write, and it is the more useful
+row.** Narrowing `float → int` *passes* the forward check, and the check is
+right: an old reader expecting a float accepts an integer without complaint.
+Nothing about the representation breaks. What breaks is the value — every price
+is truncated at the producer, and the registry has no way to know, because
+compatibility is an algebra over **types** and truncation is a statement about
+**meaning**. A registry tells you whether a change will break a reader. It cannot
+tell you whether the data is still true, and **treating a green compatibility
+check as a review is the mistake it most reliably enables.**
+
+The version travels with the record. Without the stamp a consumer has to guess
+which schema a record was written under, the usual guess is "the latest", and
+that is wrong for every record written before the last change — a replay is when
+the guess costs something. Records with no stamp at all are still readable, and
+report `None` for their schema, because a registry that refuses the existing
+archive is one nobody can adopt on a live feed.
+
 ## What is NOT built
 
-1. **Kafka and Flink themselves.** `src/log.py` implements the subset their
-   semantics that this pipeline depends on — keyed partitions, durable offsets,
+1. **Kafka and Flink themselves.** `src/log.py` implements the subset of their
+   semantics this pipeline depends on — keyed partitions, durable offsets,
    consumer groups, at-least-once delivery — so those properties can be TESTED
    rather than assumed. Deliberately absent: replication, leader election, ISR,
    exactly-once transactions, compaction, and any broker at all. Those are the
-   reasons to run Kafka, and this does not replace it.
-2. **TimescaleDB / ClickHouse.** DuckDB over Parquet answers the range queries
+   reasons to run Kafka, and this does not replace it. The runbook's escalation
+   table says so row by row: any page whose answer is "fail over" has no answer
+   here.
+2. **A registry SERVICE.** Confluent's is a service — producers and consumers
+   resolve schemas over HTTP at runtime, ids are embedded in the wire format, and
+   Avro or Protobuf does the encoding. This is the compatibility algebra and the
+   version stamp, in process, over JSON. It answers "would this change break
+   someone", which is the reasoning; it does not give two independently deployed
+   services a registry they agree on, which is the infrastructure.
+3. **TimescaleDB / ClickHouse.** DuckDB over Parquet answers the range queries
    and supports the batch recomputation the parity check needs. What is lost is
    concurrent writers, retention policies, continuous aggregates and replication
    — operational properties, none of which changes whether a bar is correct.
-3. **Grafana and alerting.** Gap detection, heartbeat loss and ingest lag are all
-   measured and exposed; nothing pages anyone, and there is no dashboard.
-4. **A written runbook.** The rebuild is a scripted, tested procedure but not a
-   document with escalation paths and decision points.
+4. **Alerting.** Gap detection, heartbeat loss and ingest lag are all measured
+   and exposed; nothing pages anyone and no dashboard renders them. The runbook
+   exists now, and **a runbook with no alert in front of it is a document read
+   after somebody noticed** — which is the wrong end of the incident. This is the
+   largest remaining gap in the project.
 5. **Sustained-load capacity numbers.** `PacedReplay` can drive 1x/10x/100x and
    reports backlog when a consumer falls behind, but the recorded session is
    ~1.3 ticks/sec of real venue traffic — far too thin to establish a throughput
    ceiling. Quoting one from it would be quoting the generator.
-6. **Schema evolution.** The log stores JSON with no registry, so a producer
-   changing a field breaks consumers silently. Kafka deployments solve this with
-   a schema registry and it is not modelled here.
+6. **Schema enforcement on the hot path.** The registry validates and stamps, and
+   `src/log.py` does not yet call it, so the guarantee is available rather than
+   enforced. Wiring it is a constructor change; the reason it is listed here is
+   that "available" and "enforced" are not the same claim.
