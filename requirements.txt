@@ -3,3 +3,4 @@ websockets>=13
 duckdb>=1.0
 pandas>=2
 pyarrow>=15
+kafka-python-ng>=2.2   # real broker: src/kafka_log.py, run_kafka_parity.py

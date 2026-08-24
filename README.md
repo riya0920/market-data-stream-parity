@@ -1,12 +1,13 @@
 # DATA-3 — Real-Time Market Data Pipeline
 
-**Status: ~93%.** Runs on a **real Kraken feed**, through a durable partitioned
+**Status: ~96%.** Runs on a **real Kraken feed**, through a durable partitioned
 log with consumer groups and committed offsets, into a Parquet archive with a
 DuckDB serving layer, with a rebuild drill that recomputes from the archive and
 diffs — plus event-time bars, emit-and-revise, streaming-vs-batch parity, a
 reorder buffer, per-key watermarks, paced replay, ingest-lag distribution,
 heartbeat-vs-gap detection, a **schema registry with real compatibility
-checking**, and an **operational runbook**. **34 tests.**
+checking**, an **operational runbook**, and a **real Kafka 4.3.1 broker the
+in-process log is now checked against**. **42 tests.**
 
 ```bash
 python record_session.py --seconds 45   # capture a live Kraken session
@@ -14,7 +15,8 @@ python run_pipeline.py                  # log -> consumers -> archive -> serving
 python run_parity.py                    # bar parity, gap flags, rebuild drill
 python run_analytics.py                 # analytics parity, watermarks, latency
 python run_schema.py                    # compatibility algebra, and its limit
-python -m pytest tests -q               # 34 tests
+python run_kafka_parity.py              # in-process log vs a real broker
+python -m pytest tests -q               # 42 tests
 ```
 
 See [docs/RUNBOOK.md](docs/RUNBOOK.md) for the on-call procedures — gap, ingest
@@ -205,36 +207,79 @@ the guess costs something. Records with no stamp at all are still readable, and
 report `None` for their schema, because a registry that refuses the existing
 archive is one nobody can adopt on a live feed.
 
+## The in-process log, checked against a real broker
+
+`src/log.py` implements the subset of Kafka's semantics this pipeline depends on
+so those properties could be *tested* rather than assumed. A broker is now
+available, so the imitation gets checked instead of trusted. `run_kafka_parity.py`
+runs the same ticks through both and diffs the bars:
+
+```
+                                      in-process         kafka
+records consumed                           6,000         6,000
+bars built                                    16            16
+bars only on this side                         0             0
+MISMATCHED BARS                                                0
+```
+
+**Exact** on open, high, low, close, volume and tick count. That establishes the
+in-process log preserves what this pipeline actually reads out of a log — per-key
+ordering and complete delivery. It does **not** establish that the imitation is
+Kafka, and the report says so.
+
+### Where they disagree, reported rather than hidden
+
+**Only 3 of 8 keys land on the same partition.** `PartitionedLog` uses a stable
+non-Python hash so assignment survives a restart (Python's `hash()` on `str` is
+salted per process, so the obvious implementation reshuffles every partition on
+every restart). Kafka uses **murmur2** on the key bytes.
+
+Reimplementing murmur2 to force agreement would be writing a second copy of the
+thing under test. The property that matters is that all records for **one** key
+land on **one** partition — both satisfy it, and a test asserts it. A parity
+claim that quietly compares only the numbers that agree is not a parity claim,
+so the disagreement is a printed line and an assertion of its own.
+
+### Three things the real broker corrected
+
+**`consumer_timeout_ms=8000` returned zero records against a topic holding
+8,000.** The consumer had not finished joining the group — and "consumed 0" is
+indistinguishable from "the topic is empty" unless you happen to know that.
+
+**A single poll is still not a drain**, and the real client makes the trap
+sharper: `poll()` can return empty simply because the fetch had not landed. The
+drain now runs to an *idle deadline* that resets whenever records arrive.
+
+**kafka-python faults on Windows** with `Invalid file descriptor: -1` when a
+socket is closed underneath its selector. The drain retries a bounded 20 times
+and then **raises** — swallowing it unbounded would be the dangerous version,
+because a drain that quietly returns short looks exactly like an empty topic.
+
 ## What is NOT built
 
-1. **Kafka and Flink themselves.** `src/log.py` implements the subset of their
-   semantics this pipeline depends on — keyed partitions, durable offsets,
-   consumer groups, at-least-once delivery — so those properties can be TESTED
-   rather than assumed. Deliberately absent: replication, leader election, ISR,
-   exactly-once transactions, compaction, and any broker at all. Those are the
-   reasons to run Kafka, and this does not replace it. The runbook's escalation
-   table says so row by row: any page whose answer is "fail over" has no answer
-   here.
-2. **A registry SERVICE.** Confluent's is a service — producers and consumers
-   resolve schemas over HTTP at runtime, ids are embedded in the wire format, and
-   Avro or Protobuf does the encoding. This is the compatibility algebra and the
-   version stamp, in process, over JSON. It answers "would this change break
-   someone", which is the reasoning; it does not give two independently deployed
-   services a registry they agree on, which is the infrastructure.
-3. **TimescaleDB / ClickHouse.** DuckDB over Parquet answers the range queries
-   and supports the batch recomputation the parity check needs. What is lost is
-   concurrent writers, retention policies, continuous aggregates and replication
-   — operational properties, none of which changes whether a bar is correct.
-4. **Alerting.** Gap detection, heartbeat loss and ingest lag are all measured
-   and exposed; nothing pages anyone and no dashboard renders them. The runbook
-   exists now, and **a runbook with no alert in front of it is a document read
-   after somebody noticed** — which is the wrong end of the incident. This is the
-   largest remaining gap in the project.
-5. **Sustained-load capacity numbers.** `PacedReplay` can drive 1x/10x/100x and
-   reports backlog when a consumer falls behind, but the recorded session is
-   ~1.3 ticks/sec of real venue traffic — far too thin to establish a throughput
-   ceiling. Quoting one from it would be quoting the generator.
-6. **Schema enforcement on the hot path.** The registry validates and stamps, and
-   `src/log.py` does not yet call it, so the guarantee is available rather than
-   enforced. Wiring it is a constructor change; the reason it is listed here is
-   that "available" and "enforced" are not the same claim.
+1. **A multi-broker cluster.** The broker is real and there is exactly one, so
+   replication, leader election, ISR shrink and exactly-once transactions —
+   the actual reasons to run Kafka — are still unexercised. This is a smaller
+   gap than "no broker at all" and it is not nothing.
+2. **Kafka on the pipeline's own path.** `run_pipeline.py` still uses the
+   in-process log; the Kafka backend is a parallel implementation the parity
+   check compares against. Keeping both is deliberate — swapping would delete
+   the thing that makes the comparison possible — but it means the shipped
+   pipeline is still the imitation.
+3. **Flink.** No stream-processing framework: the bar builder is plain Python,
+   so there is no distributed state backend, no checkpointing and no savepoints.
+4. **A registry SERVICE.** Confluent's is a service — producers and consumers
+   resolve schemas over HTTP at runtime and Avro or Protobuf does the encoding.
+   This is the compatibility algebra and the version stamp, in process, over
+   JSON.
+5. **TimescaleDB / ClickHouse.** DuckDB over Parquet answers the range queries
+   and supports the batch recomputation the parity check needs. Concurrent
+   writers, retention policies, continuous aggregates and replication are lost.
+6. **Alerting.** Gap detection, heartbeat loss and ingest lag are all measured
+   and exposed; nothing pages anyone. The runbook exists, and a runbook with no
+   alert in front of it is a document read after somebody noticed.
+7. **Sustained-load capacity numbers.** The recorded session is ~1.3 ticks/sec
+   of real venue traffic — far too thin to establish a throughput ceiling.
+8. **Schema enforcement on the hot path.** The registry validates and stamps,
+   and `src/log.py` does not call it, so the guarantee is available rather than
+   enforced.
