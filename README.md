@@ -1,13 +1,13 @@
 # DATA-3 — Real-Time Market Data Pipeline
 
-**Status: ~96%.** Runs on a **real Kraken feed**, through a durable partitioned
+**Status: ~97%.** Runs on a **real Kraken feed**, through a durable partitioned
 log with consumer groups and committed offsets, into a Parquet archive with a
 DuckDB serving layer, with a rebuild drill that recomputes from the archive and
 diffs — plus event-time bars, emit-and-revise, streaming-vs-batch parity, a
 reorder buffer, per-key watermarks, paced replay, ingest-lag distribution,
 heartbeat-vs-gap detection, a **schema registry with real compatibility
 checking**, an **operational runbook**, and a **real Kafka 4.3.1 broker the
-in-process log is now checked against**. **42 tests.**
+in-process log is now checked against**. **46 tests.**
 
 ```bash
 python record_session.py --seconds 45   # capture a live Kraken session
@@ -16,7 +16,7 @@ python run_parity.py                    # bar parity, gap flags, rebuild drill
 python run_analytics.py                 # analytics parity, watermarks, latency
 python run_schema.py                    # compatibility algebra, and its limit
 python run_kafka_parity.py              # in-process log vs a real broker
-python -m pytest tests -q               # 42 tests
+python -m pytest tests -q               # 46 tests
 ```
 
 See [docs/RUNBOOK.md](docs/RUNBOOK.md) for the on-call procedures — gap, ingest
@@ -255,6 +255,23 @@ socket is closed underneath its selector. The drain retries a bounded 20 times
 and then **raises** — swallowing it unbounded would be the dangerous version,
 because a drain that quietly returns short looks exactly like an empty topic.
 
+## Schema enforcement moved onto the write path
+
+The registry could validate and stamp a record, and **nothing called it**. So a
+producer renaming a field still wrote the record, and the consumer still
+computed a number from a field that was not there — the guarantee sat beside the
+write path rather than on it.
+
+`PartitionedLog(registry=..., subject=...)` now validates on `append`, and
+refuses a **batch whole** if any record in it fails. A partially applied batch
+is the worst outcome available: the producer sees an error and the log contains
+some of it.
+
+Enforcement is opt-in, deliberately. A log that refuses to start without a
+registered schema cannot be adopted on a live feed, and an un-adoptable control
+is not a control — so records written before a subject was registered stay
+readable, and a caller with no registry gets the old behaviour.
+
 ## What is NOT built
 
 1. **A multi-broker cluster.** The broker is real and there is exactly one, so
@@ -280,6 +297,8 @@ because a drain that quietly returns short looks exactly like an empty topic.
    alert in front of it is a document read after somebody noticed.
 7. **Sustained-load capacity numbers.** The recorded session is ~1.3 ticks/sec
    of real venue traffic — far too thin to establish a throughput ceiling.
-8. **Schema enforcement on the hot path.** The registry validates and stamps,
-   and `src/log.py` does not call it, so the guarantee is available rather than
-   enforced.
+8. **Schema enforcement is opt-in.** `PartitionedLog(registry=..., subject=...)`
+   validates and stamps on the write and refuses a batch whole if any record
+   fails. It is opt-in on purpose -- a log that will not start without a
+   registered schema cannot be adopted on a live feed -- which means a caller
+   who omits the registry gets the old unchecked behaviour.

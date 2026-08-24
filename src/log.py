@@ -43,13 +43,42 @@ class Record:
 
 
 class PartitionedLog:
-    def __init__(self, root: Path, partitions: int = 4):
+    def __init__(self, root: Path, partitions: int = 4, registry=None,
+                 subject: str | None = None):
+        """`registry` and `subject` turn schema checking from AVAILABLE to
+        ENFORCED.
+
+        `src/schema_registry.py` could validate and stamp a record, and nothing
+        called it -- so a producer renaming a field still wrote the record and
+        the consumer still computed a number from a field that was not there.
+        The guarantee existed beside the write path rather than on it.
+
+        Enforcement is opt-in rather than mandatory, and that is deliberate: a
+        log that refuses to start without a registered schema cannot be adopted
+        on a live feed, and an un-adoptable control is not a control. Records
+        written before a subject was registered stay readable.
+        """
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.partitions = partitions
+        self.registry = registry
+        self.subject = subject
+        self.rejected = 0
         self._locks = [threading.Lock() for _ in range(partitions)]
         for p in range(partitions):
             self._path(p).touch(exist_ok=True)
+
+    def _enforce(self, value: dict) -> dict:
+        """Validate and stamp, or raise. Called on the WRITE, which is the only
+        place it is cheap -- once a record is in the log every consumer has to
+        cope with it forever."""
+        if self.registry is None or self.subject is None:
+            return value
+        try:
+            return self.registry.envelope(self.subject, value)
+        except Exception:
+            self.rejected += 1
+            raise
 
     def _path(self, partition: int) -> Path:
         return self.root / "partition-{}.log".format(partition)
@@ -64,6 +93,7 @@ class PartitionedLog:
         return h % self.partitions
 
     def append(self, key: str, value: dict) -> Record:
+        value = self._enforce(value)
         p = self.partition_for(key)
         with self._locks[p]:
             path = self._path(p)
@@ -74,6 +104,11 @@ class PartitionedLog:
             return Record(p, offset, key, value)
 
     def append_many(self, items: list[tuple[str, dict]]) -> int:
+        # Enforce BEFORE partitioning, so a batch containing one bad record is
+        # refused whole rather than half-written. A partially applied batch is
+        # the worst outcome: the producer sees an error and the log contains
+        # some of it.
+        items = [(k, self._enforce(v)) for k, v in items]
         by_partition: dict[int, list] = {}
         for key, value in items:
             by_partition.setdefault(self.partition_for(key), []).append((key, value))
