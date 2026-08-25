@@ -278,7 +278,14 @@ readable, and a caller with no registry gets the old behaviour.
    replication, leader election, ISR shrink and exactly-once transactions —
    the actual reasons to run Kafka — are still unexercised. This is a smaller
    gap than "no broker at all" and it is not nothing.
-2. **Kafka on the pipeline's own path.** `run_pipeline.py` still uses the
+2. ~~**Kafka on the pipeline's own path.**~~ **DONE** — `src/backend.py` puts
+   one interface over both logs and `run_pipeline_backend.py` runs the real
+   pipeline on either, producing an identical bar fingerprint
+   (`d712581cd09daf07`). Three claims were refuted by running it: the two
+   backends put the same key in **different** partitions (so committed offsets
+   do not port), Kafka's record grouping **varies between runs**, and waiting on
+   `describe_topics` does not fix the produce race. See `docs/BACKEND_PARITY.md`.
+   Superseded note: `run_pipeline.py` still uses the
    in-process log; the Kafka backend is a parallel implementation the parity
    check compares against. Keeping both is deliberate — swapping would delete
    the thing that makes the comparison possible — but it means the shipped
