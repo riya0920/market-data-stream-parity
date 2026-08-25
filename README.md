@@ -292,14 +292,38 @@ readable, and a caller with no registry gets the old behaviour.
    pipeline is still the imitation.
 3. **Flink.** No stream-processing framework: the bar builder is plain Python,
    so there is no distributed state backend, no checkpointing and no savepoints.
-4. **A registry SERVICE.** Confluent's is a service — producers and consumers
+4. ~~**A registry SERVICE.**~~ **DONE** — `registry_service.py` serves the
+   registry over HTTP on Confluent-shaped paths, so producers and consumers
+   share one arbiter instead of each holding a private dictionary. A second
+   client is refused a breaking change **because the service saw the first**,
+   and a consumer resolves a version it never registered. An unknown version is
+   404 rather than a silent fallback to `latest`, because reading a record
+   under a schema that did not write it is worse than refusing it.
+
+   `RegistryClient.fail_mode` poses the question an in-process registry cannot:
+   `refuse` (an unvalidated record is worse than no record) or `cache` (the
+   stream stopping is worse than a stale schema). One real bug found: a 404 was
+   being reported as *"registry unreachable"* because `HTTPError` subclasses
+   `URLError` — an answer reported as an outage, and under `cache` it would
+   have served a stale schema for a version the registry says does not exist.
+   Superseded note: Confluent's is a service — producers and consumers
    resolve schemas over HTTP at runtime and Avro or Protobuf does the encoding.
    This is the compatibility algebra and the version stamp, in process, over
    JSON.
 5. **TimescaleDB / ClickHouse.** DuckDB over Parquet answers the range queries
    and supports the batch recomputation the parity check needs. Concurrent
    writers, retention policies, continuous aggregates and replication are lost.
-6. **Alerting.** Gap detection, heartbeat loss and ingest lag are all measured
+6. ~~**Alerting.**~~ **DONE** — `src/alerting.py` turns the health signals into
+   rules, each naming an OWNER and an ACTION. The decision that shapes the file:
+   **tick silence alone never pages**, because a quiet market and a dead socket
+   look identical — only heartbeat loss does. Gaps are session-aware, since a
+   rule that fires every evening is one nobody reads; a gap inside a session
+   pages the *venue liaison*, not the feed team, because the feed is alive and
+   the venue stopped sending. Negative lag routes to *platform* as clock skew
+   rather than paging the feed team for an NTP problem. `render_prometheus`
+   exports the state so SE-3's Alertmanager can do the paging rather than this
+   project growing its own notifier. Superseded note: Gap detection, heartbeat
+   loss and ingest lag are all measured
    and exposed; nothing pages anyone. The runbook exists, and a runbook with no
    alert in front of it is a document read after somebody noticed.
 7. **Sustained-load capacity numbers.** The recorded session is ~1.3 ticks/sec
