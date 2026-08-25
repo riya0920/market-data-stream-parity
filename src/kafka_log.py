@@ -61,6 +61,22 @@ class KafkaLog:
             admin.create_topics([NewTopic(topic, partitions, replication)])
         except TopicAlreadyExistsError:
             pass
+        else:
+            # WAIT FOR LEADER ELECTION before returning. `create_topics` returns
+            # once the controller has accepted the topic, not once every
+            # partition has an elected leader -- and a producer that sends into
+            # that gap gets NotLeaderForPartitionError.
+            #
+            # This is not hypothetical tidiness: it is the error the pipeline
+            # actually hit the first time it ran against the broker. The
+            # producer already sets retries=5, and that was not enough, because
+            # the retry budget is spent before the metadata propagates.
+            #
+            # It is a genuine distributed-systems race rather than a client
+            # defect, and the fix belongs here rather than in a retry loop at
+            # every call site -- a topic with no leader is not ready to be
+            # written to, so "ready" is what the constructor should mean.
+            self._await_leaders(admin, topic, partitions)
         finally:
             admin.close()
 
@@ -77,17 +93,109 @@ class KafkaLog:
             linger_ms=5,
             retries=5)
 
+    @staticmethod
+    def _await_leaders(admin, topic: str, partitions: int,
+                       timeout_s: float = 30.0) -> None:
+        """Wait until every partition is described, with a leader and no error.
+
+        A NECESSARY CHECK AND NOT A SUFFICIENT ONE, which is worth stating
+        because the first version of this method assumed it was sufficient and
+        the produce still failed.
+
+        `describe_topics` reports `leader=1` for every partition IMMEDIATELY
+        after creation -- measured, not guessed. The controller has assigned
+        leadership in cluster metadata, but the broker has not necessarily
+        finished transitioning to leader for those partitions locally, and a
+        produce landing in that window gets NotLeaderForPartitionError.
+
+        So this catches the slow cases (topic not yet visible, a partition
+        genuinely leaderless, a non-zero error_code) and `append_many` carries a
+        retry for the fast one that no metadata query can see. Readiness for
+        writing is only observable by writing.
+        """
+        import time
+
+        deadline = time.monotonic() + timeout_s
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                meta = admin.describe_topics([topic])
+            except Exception as exc:                        # noqa: BLE001
+                last = exc
+                time.sleep(0.3)
+                continue
+            parts = (meta[0].get("partitions") if meta else None) or []
+            bad = [p.get("partition") for p in parts
+                   if p.get("leader", -1) < 0 or p.get("error_code", 0)]
+            if len(parts) >= partitions and not bad:
+                return
+            last = "partitions={} not_ready={}".format(len(parts), bad)
+            time.sleep(0.3)
+        raise RuntimeError(
+            "topic {!r} still not fully led after {}s ({}). Refusing to return "
+            "a log that would fail on first write."
+            .format(topic, timeout_s, last))
+
     def append(self, key: str, value: dict) -> KafkaRecord:
         meta = self.producer.send(self.topic, key=key, value=value).get(timeout=30)
         return KafkaRecord(meta.partition, meta.offset, key, value)
 
-    def append_many(self, items) -> int:
-        futures = [self.producer.send(self.topic, key=k, value=v)
-                   for k, v in items]
-        for f in futures:
-            f.get(timeout=60)
-        self.producer.flush()
-        return len(futures)
+    def append_many(self, items, attempts: int = 5) -> int:
+        """Produce every item, retrying the ones that hit a RETRIABLE error.
+
+        WHY A CALLER-LEVEL RETRY EXISTS WHEN THE PRODUCER ALREADY HAS
+        `retries=5`, because that looks redundant and is not.
+
+        A freshly created topic reports an elected leader in the controller's
+        metadata before the broker has finished transitioning to leader for
+        those partitions locally. `describe_topics` therefore answers
+        `leader=1` immediately and is NOT a readiness signal -- an earlier
+        version of this class waited on exactly that and still failed, which is
+        how the distinction was found.
+
+        The producer's own retries are consumed inside a few hundred
+        milliseconds of backoff and give up before the broker is ready. A
+        caller-level retry with a metadata refresh between attempts spans the
+        gap, and only the FAILED items are resent -- resending the whole batch
+        would duplicate everything that already succeeded, turning a transient
+        error into permanent data corruption.
+
+        Only NotLeaderForPartitionError and its siblings are retried. A
+        serialisation failure or an oversized record is not transient and
+        retrying it just fails five times more slowly.
+        """
+        import time
+
+        from kafka.errors import (KafkaTimeoutError, NotLeaderForPartitionError,
+                                  RequestTimedOutError)
+
+        RETRIABLE = (NotLeaderForPartitionError, RequestTimedOutError,
+                     KafkaTimeoutError)
+
+        pending = list(items)
+        sent = 0
+        for attempt in range(attempts):
+            futures = [(k, v, self.producer.send(self.topic, key=k, value=v))
+                       for k, v in pending]
+            failed = []
+            for k, v, f in futures:
+                try:
+                    f.get(timeout=60)
+                    sent += 1
+                except RETRIABLE:
+                    failed.append((k, v))
+            self.producer.flush()
+            if not failed:
+                return sent
+            pending = failed
+            # Refresh metadata and back off before trying the stragglers again.
+            self.producer._metadata.request_update()
+            time.sleep(0.5 * (attempt + 1))
+
+        raise RuntimeError(
+            "{} of {} records still failing with a retriable error after {} "
+            "attempts; refusing to report a partial produce as complete"
+            .format(len(pending), len(items), attempts))
 
     def partition_for(self, key: str) -> int:
         """Kafka's own answer, obtained by asking it rather than reimplementing.
@@ -225,13 +333,60 @@ class KafkaConsumerGroup:
         self.consumer.close()
 
 
-def available(bootstrap: str = BOOTSTRAP) -> bool:
-    """Is a broker reachable? Used to skip rather than fail."""
-    try:
-        from kafka import KafkaAdminClient
+def available(bootstrap: str = BOOTSTRAP, attempts: int = 3,
+              request_timeout_ms: int = 15_000) -> bool:
+    """Is a broker reachable? Used to skip rather than fail.
 
-        a = KafkaAdminClient(bootstrap_servers=bootstrap, request_timeout_ms=5_000)
-        a.close()
-        return True
-    except Exception:                                        # noqa: BLE001
-        return False
+    Retried, and with a longer budget than the 5s this used to allow, because
+    A SKIP THAT LOOKS LIKE A PASS IS THE WORST OUTCOME A CONDITIONAL TEST CAN
+    PRODUCE. A short probe against a broker that is up but busy returns False,
+    the caller prints "skipping", the suite goes green, and nothing anywhere
+    says the thing under test never ran.
+
+    This was observed rather than anticipated: the same broker answered a
+    standalone probe and failed the identical call inside a pipeline run,
+    because it was loaded and the 5s window was not enough. The probe was wrong,
+    not the broker.
+    """
+    import time
+
+    from kafka import KafkaAdminClient
+
+    for i in range(attempts):
+        try:
+            a = KafkaAdminClient(bootstrap_servers=bootstrap,
+                                 request_timeout_ms=request_timeout_ms)
+            a.close()
+            return True
+        except Exception:                                    # noqa: BLE001
+            if i < attempts - 1:
+                time.sleep(1.0)
+    return False
+
+
+def delete_topics(prefixes, bootstrap: str = BOOTSTRAP) -> list:
+    """Remove throwaway topics left behind by earlier runs.
+
+    Every parity run creates a uniquely-named topic and never removes it. On a
+    long-lived broker those accumulate, and each one costs metadata, open file
+    handles and log-recovery time at startup -- a broker carrying a hundred dead
+    test topics is measurably slower to start and answer, which is how the
+    availability probe above started failing in the first place.
+
+    Prefix-scoped rather than "delete everything": internal topics
+    (__consumer_offsets, __cluster_metadata) must survive, and deleting a topic
+    is not reversible.
+    """
+    from kafka import KafkaAdminClient
+
+    admin = KafkaAdminClient(bootstrap_servers=bootstrap,
+                             request_timeout_ms=30_000)
+    try:
+        doomed = [t for t in admin.list_topics()
+                  if any(t.startswith(p) for p in prefixes)
+                  and not t.startswith("__")]
+        if doomed:
+            admin.delete_topics(doomed)
+        return sorted(doomed)
+    finally:
+        admin.close()
